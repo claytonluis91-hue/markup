@@ -1,74 +1,65 @@
-import sqlite3
+import xml.etree.ElementTree as ET
 import pandas as pd
-from datetime import datetime
 
 # ==========================================
-# MÓDULO DE BANCO DE DADOS
+# MÓDULO DE LEITURA DE XML (NF-e Sefaz)
 # ==========================================
-def conectar_db():
-    return sqlite3.connect('precificacao_avancada.db')
-
-def iniciar_banco():
-    conn = conectar_db()
-    c = conn.cursor()
-    # Tabela de Clientes
-    c.execute('''CREATE TABLE IF NOT EXISTS clientes 
-                 (cnpj TEXT PRIMARY KEY, nome TEXT, regime TEXT)''')
-    
-    # Nova Tabela: Cadastro de Produtos (Preparando para o XML)
-    c.execute('''CREATE TABLE IF NOT EXISTS produtos 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                  cnpj TEXT, cProd TEXT, xProd TEXT, ncm TEXT, 
-                  custo REAL, preco_venda REAL)''')
-    
-    conn.commit()
-    conn.close()
-
-def buscar_cliente(cnpj):
-    conn = conectar_db()
-    df = pd.read_sql(f"SELECT * FROM clientes WHERE cnpj = '{cnpj}'", conn)
-    conn.close()
-    return df.iloc[0].to_dict() if not df.empty else None
-
-def salvar_cliente(cnpj, nome, regime):
-    conn = conectar_db()
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO clientes VALUES (?, ?, ?)', (cnpj, nome, regime))
-    conn.commit()
-    conn.close()
-
-# ==========================================
-# MÓDULO DE CÁLCULOS FISCAIS E FINANCEIROS
-# ==========================================
-def calcular_markup(custo, impostos_pct, despesas_pct, comissao_pct, lucro_pct):
+def processar_lote_xml(lista_arquivos_xml):
     """
-    Recebe os parâmetros, aplica a regra do Markup Divisor e retorna um dicionário com os resultados.
+    Lê uma lista de arquivos XML (NF-e) carregados pelo Streamlit,
+    extrai os produtos, preços de venda e NCM, e retorna um DataFrame.
     """
-    total_deducoes = impostos_pct + despesas_pct + comissao_pct + lucro_pct
+    lista_produtos = []
     
-    if total_deducoes >= 100:
-        return {"erro": "Deduções ultrapassam 100%. Cálculo impossível."}
+    # O namespace padrão da Sefaz que sempre vem nos XMLs de NF-e
+    ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
     
-    divisor = (100 - total_deducoes) / 100
-    preco_venda = custo / divisor
-    lucro_reais = preco_venda * (lucro_pct / 100)
-    
-    return {
-        "erro": None,
-        "preco_venda": preco_venda,
-        "lucro_reais": lucro_reais,
-        "markup_multiplicador": preco_venda / custo if custo > 0 else 0
-    }
+    for arquivo in lista_arquivos_xml:
+        try:
+            # Lê o conteúdo do arquivo carregado pelo Streamlit
+            tree = ET.parse(arquivo)
+            root = tree.getroot()
+            
+            # Navega por cada item (tag <det>) dentro da nota fiscal
+            for det in root.findall('.//nfe:det', ns):
+                # Extrai as informações da tag <prod>
+                prod = det.find('nfe:prod', ns)
+                
+                cProd = prod.find('nfe:cProd', ns).text if prod.find('nfe:cProd', ns) is not None else ""
+                xProd = prod.find('nfe:xProd', ns).text if prod.find('nfe:xProd', ns) is not None else ""
+                ncm = prod.find('nfe:NCM', ns).text if prod.find('nfe:NCM', ns) is not None else ""
+                cfop = prod.find('nfe:CFOP', ns).text if prod.find('nfe:CFOP', ns) is not None else ""
+                uCom = prod.find('nfe:uCom', ns).text if prod.find('nfe:uCom', ns) is not None else ""
+                
+                # Preço Unitário Comercial (O que o cliente cobrou de fato)
+                vUnCom_str = prod.find('nfe:vUnCom', ns).text if prod.find('nfe:vUnCom', ns) is not None else "0"
+                vUnCom = float(vUnCom_str)
+                
+                # Opcional: Pegar o CST/CSOSN do ICMS para saber a tributação exata daquele item
+                imposto = det.find('nfe:imposto', ns)
+                icms_tag = imposto.find('.//nfe:ICMS/*', ns) if imposto is not None else None
+                cst_csosn = ""
+                if icms_tag is not None:
+                    # Tenta pegar CSOSN (Simples) ou CST (Normal)
+                    cst_csosn = icms_tag.find('nfe:CSOSN', ns).text if icms_tag.find('nfe:CSOSN', ns) is not None else \
+                                (icms_tag.find('nfe:CST', ns).text if icms_tag.find('nfe:CST', ns) is not None else "")
+                
+                # Monta o dicionário com a linha do produto
+                lista_produtos.append({
+                    "Arquivo": arquivo.name,
+                    "Código": cProd,
+                    "Descrição": xProd,
+                    "NCM": ncm,
+                    "CFOP": cfop,
+                    "Unidade": uCom,
+                    "Preço de Venda (R$)": vUnCom,
+                    "CST/CSOSN": cst_csosn
+                })
+                
+        except Exception as e:
+            # Se um XML vier corrompido, o sistema avisa mas não trava os outros
+            print(f"Erro ao processar o arquivo {arquivo.name}: {e}")
+            continue
 
-def calcular_margem_real(preco_mercado, custo, impostos_pct, despesas_pct, comissao_pct):
-    """
-    Faz o caminho inverso para descobrir quanto sobra no bolso.
-    """
-    deducoes_reais = preco_mercado * ((impostos_pct + despesas_pct + comissao_pct) / 100)
-    lucro_real = preco_mercado - custo - deducoes_reais
-    margem_pct = (lucro_real / preco_mercado) * 100 if preco_mercado > 0 else 0
-    
-    return {
-        "lucro_real": lucro_real,
-        "margem_pct": margem_pct
-    }
+    # Converte a lista de dicionários para uma tabela (DataFrame) do Pandas
+    return pd.DataFrame(lista_produtos)
